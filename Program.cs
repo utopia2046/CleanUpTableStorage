@@ -12,46 +12,35 @@ namespace CleanUpProdTables
     {
         static void Main(string[] args)
         {
-            DateTime startTime = DateTime.UtcNow;
-            int accountsNumber = Consts.Accounts.Count;
+            if (args.Length != 2)
+            {
+                PrintHelp();
+                return;
+            }
 
-            Task<long[]> parent = new Task<long[]>(() => {
-                var results = new long[accountsNumber];
+            try
+            {
+                DateTime startTime = DateTime.Parse(args[0]);
+                DateTime endTime = DateTime.Parse(args[1]);
+                Console.WriteLine("Start time: {0}", startTime);
+                Console.WriteLine("end time: {0}", endTime);
 
-                for (int i = 0; i < accountsNumber; i++)
-                {
-                    // This loop is running in parallel so if directly use i, i could be equal to accountsNumber
-                    int index = i;
-                    new Task(() => results[index] = CleanUpAccount(Consts.Accounts[index].Name, Consts.Accounts[index].Key),
-                        TaskCreationOptions.AttachedToParent).Start();
-                }
+                CleanUp(startTime, endTime);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine(ex.Message);
+                return;
+            }
 
-                return results;
-            });
-
-            // When the parent and its children have run to completion, display the results
-            long sum = 0;
-            var cwt = parent.ContinueWith(p => {
-                DateTime endTime = DateTime.UtcNow;
-                Console.WriteLine("Start Time: {0}", startTime.ToString(Consts.DateFormat));
-                Console.WriteLine("End Time  : {0}", endTime.ToString(Consts.DateFormat));
-                Console.WriteLine("Time Cost : {0}", endTime - startTime);
-
-                Array.ForEach(p.Result, result => sum += result);
-                Console.WriteLine("Deleted Entities: {0}", sum);
-            });
-
-            // Start the parent Task so it can start its children
-            parent.Start();
-
-            cwt.Wait();
-            Console.WriteLine("All tasks done, press any key to exit.");
-            Console.ReadKey();
+            Console.WriteLine("All tasks done.");
         }
 
-        static void ShowResult(long result)
+        static void PrintHelp()
         {
-            Console.WriteLine("Child Task done. Totally {0} entities deleted.", result);
+            Console.WriteLine("CleanUpProdTable <startDate> <endDate>");
+            Console.WriteLine("Example:");
+            Console.WriteLine("CleanUpProdTable 2016-1-8 2016-1-18");
         }
 
         static CloudTableClient GetClient(string connectionString)
@@ -67,35 +56,69 @@ namespace CleanUpProdTables
             return client.GetTableReference(tableName);
         }
 
-        static string GetStartDateString(DateTime date)
+        static string GetDateString(DateTime date)
         {
             return date.ToString(Consts.DateFormat);
         }
 
-        static TableQuery<DynamicTableEntity> BuildQuery(DateTime startDate, int takeCount)
+        static TableQuery<DynamicTableEntity> BuildQuery(string startTimeString, string endTimeString)
         {
+            var queryString = String.Format("PartitionKey ge '{0}' and PartitionKey le '{1}'", startTimeString, endTimeString);
+
             var query = new TableQuery<DynamicTableEntity>()
-                .Where(TableQuery.GenerateFilterCondition("PartitionKey", QueryComparisons.LessThan, GetStartDateString(startDate)))
+                .Where(queryString)
                 .Select(new string[] { "PartitionKey", "RowKey" })
-                .Take(takeCount);
+                .Take(Consts.BatchSize);
 
             return query;
         }
 
-        static long DeleteEntitiesInTable(string accountName, CloudTable table)
+        static string GenerateCompoundKey(string accountName, string tableName)
         {
-            Console.WriteLine("Start cleaning up Account:{0} Table:{1}", accountName, table.Name);
+            return String.Concat(accountName, "_", tableName);
+        }
 
+        static Dictionary<string, CloudTable> GenerateTableDict()
+        {
+            var tablesDict = new Dictionary<string, CloudTable>();
+
+            foreach (var account in Consts.Accounts)
+            {
+                var client = GetClient(account.Key);
+                foreach (var tableName in Consts.TableNames)
+                {
+                    var table = GetTable(client, tableName);
+                    tablesDict.Add(GenerateCompoundKey(account.Name, tableName), table);
+                }
+            }
+
+            return tablesDict;
+        }
+
+        static List<Tuple<string, string>> GenerateTimeSlotList(DateTime startTime, DateTime endTime, TimeSpan slotSize)
+        {
+            var slots = new List<Tuple<string, string>>();
+            var time = startTime;
+
+            while (time < endTime - slotSize)
+            {
+                var startTimeString = GetDateString(time);
+                var endTimeString = GetDateString(time.Add(slotSize));
+                slots.Add(new Tuple<string, string>(startTimeString, endTimeString));
+                time += slotSize;
+            }
+
+            slots.Add(new Tuple<string, string>(GetDateString(time), GetDateString(endTime)));
+            return slots;
+        }
+
+        static void DeleteEntitiesInTable(string key, CloudTable table, TableQuery<DynamicTableEntity> query)
+        {
             var sum = 0;
-            var startDate = DateTime.UtcNow.AddDays(-Consts.RetentionDays);
-            var dateString = GetStartDateString(startDate);
-            var query = BuildQuery(startDate, Consts.BatchSize);
-            Console.WriteLine("QueryString: {0}", query.FilterString);
-
             while (true)
             {
-                var entities = table.ExecuteQuery(query);
                 var count = 0;
+                var entities = table.ExecuteQuery(query);
                 foreach (var entry in entities)
                 {
                     try
@@ -107,31 +130,32 @@ namespace CleanUpProdTables
                         }
                         count++;
                     }
+                    catch (StorageException ex)
+                    {
+                        if (ex.RequestInformation.HttpStatusCode != 404)
+                        {
+                            Console.WriteLine("Exception: {0}", ex.Message);
+                        }
+                    }
                     catch (Exception ex)
                     {
                         Console.WriteLine("Exception: {0}", ex.Message);
                     }
                 }
 
+                Console.WriteLine("Batch done for {0}. {1} entities deleted.", key, count);
+                Console.WriteLine("  Query: {0}.", query.FilterString);
+
                 sum += count;
                 if (count <= 0) break;
-
-                Console.WriteLine("Batch delete done in Account:{0} Table: {1}. {2} entries removed.", accountName, table.Name, count);
             }
 
-            Console.WriteLine("Table cleanup done for Account:{0} Table: {1}.", accountName, table.Name);
-            Console.WriteLine("  {0} rows in total.\n", sum);
-            return sum;
+            Console.WriteLine("Table cleanup done for {0}. {1} entries removed.", key, sum);
         }
-        static long BatchDeleteEntitiesInTable(string accountName, CloudTable table)
-        {
-            Console.WriteLine("Start cleaning up Account:{0} Table:{1}", accountName, table.Name);
 
+        static void BatchDeleteEntitiesInTable(string key, CloudTable table, TableQuery<DynamicTableEntity> query)
+        {
             var sum = 0;
-            var startDate = DateTime.UtcNow.AddDays(-Consts.RetentionDays);
-            var dateString = GetStartDateString(startDate);
-            var query = BuildQuery(startDate, Consts.BatchSize);
-            Console.WriteLine("QueryString: {0}", query.FilterString);
 
             while (true)
             {
@@ -166,55 +190,48 @@ namespace CleanUpProdTables
                 try
                 {
                     var result = table.ExecuteBatch(batchOperation);
+                    Console.WriteLine("Batch done for {0}. {1} entities deleted.", key, count);
+                    Console.WriteLine("  Query: {0}.", query.FilterString);
+                }
+                catch (StorageException ex)
+                {
+                    if (ex.RequestInformation.HttpStatusCode != 404)
+                    {
+                        Console.WriteLine("Exception: {0}", ex.Message);
+                    }
                 }
                 catch (Exception ex)
                 {
                     Console.WriteLine("Exception: {0}", ex.Message);
                 }
-
-                Console.WriteLine("Batch delete done in Account:{0} Table: {1}.", accountName, table.Name);
-                Console.WriteLine("  Partition Key:'{0}'. {1} entries removed.", batchPartitionKey, count);
             }
 
-            Console.WriteLine("Table cleanup done for Account:{0} Table: {1}.", accountName, table.Name);
-            Console.WriteLine("  {0} rows in total.\n", sum);
-            return sum;
+            Console.WriteLine("Table cleanup done for {0}. {1} entries removed.", key, sum);
         }
 
-        static long CleanUpAccount(string accountName, string connectionString)
+        static void CleanUp(DateTime startTime, DateTime endTime)
         {
-            Console.WriteLine("Start cleaning up account: {0}", accountName);
+            var tasks = new List<Task>();
+            var tables = GenerateTableDict();
+            var timeSlots = GenerateTimeSlotList(startTime, endTime, Consts.TimeSlotSize);
 
-            long sum = 0;
-            var tasks = new List<Task<long>>();
-            var client = GetClient(connectionString);
-
-            for (int i = 0; i < Consts.TableNames.Length; i++)
+            foreach (var slot in timeSlots)
             {
-                var index = i;
-                var table = GetTable(client, Consts.TableNames[index]);
-
-                // Since table PartitionKey is in format like 'MM-dd-yyyy HH:mm:ss', and batch operation requires all operations have same PartitionKey
-                // Only for these 2 tables there are usually multiple entities under same PartitionKey and Batch operation could be faster
-                // For other tables, batch operation is even slower, since after each deletion we need to query again
-                if (table.Name == "Performance" || table.Name == "Trace")
+                var query = BuildQuery(slot.Item1, slot.Item2);
+                foreach (var table in tables)
                 {
-                    tasks.Add(Task<long>.Factory.StartNew(() => BatchDeleteEntitiesInTable(accountName, table)));
-                }
-                else
-                {
-                    tasks.Add(Task<long>.Factory.StartNew(() => DeleteEntitiesInTable(accountName, table)));
+                    if (table.Value.Name == "Performance" || table.Value.Name == "Trace")
+                    {
+                        tasks.Add(Task.Factory.StartNew(() => BatchDeleteEntitiesInTable(table.Key, table.Value, query)));
+                    }
+                    else
+                    {
+                        tasks.Add(Task.Factory.StartNew(() => DeleteEntitiesInTable(table.Key, table.Value, query)));
+                    }
                 }
             }
 
             Task.WaitAll(tasks.ToArray());
-            foreach (var task in tasks)
-            {
-                sum += task.Result;
-            }
-
-            Console.WriteLine("Cleaning up account: {0} done. {1} entities deleted in total", accountName, sum);
-            return sum;
         }
     }
 }
