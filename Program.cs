@@ -213,7 +213,8 @@ namespace CleanUpProdTables
         {
             var tasks = new List<Task>();
             var tables = GenerateTableDict();
-            var timeSlots = GenerateTimeSlotList(startTime, endTime, Consts.TimeSlotSize);
+            var slotSize = CleanUpProdTables.Properties.Settings.Default.TimeSlotSize;
+            var timeSlots = GenerateTimeSlotList(startTime, endTime, slotSize);
 
             foreach (var slot in timeSlots)
             {

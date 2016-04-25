@@ -11,7 +11,6 @@ namespace CleanUpProdTables
         public const string DateFormat = "MM-dd-yyyy HH:mm:ss";
         public const int BatchSize = 100;
         public const int RetentionDays = 60;
-        public static TimeSpan TimeSlotSize = TimeSpan.FromHours(6);
 
         public static string[] TableNames = { "Error", "ApplicationError", "UserError", "Latency", "Performance", "Trace" };
 
